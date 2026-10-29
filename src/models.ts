@@ -1,18 +1,4 @@
-/** User-facing model ids accepted by acp-run. */
-export const ALLOWED_MODELS = [
-  "claude-sonnet-5-5",
-  "claude-haiku-5-5",
-] as const;
-
-export type AllowedModel = (typeof ALLOWED_MODELS)[number];
-
-export const DEFAULT_MODEL: AllowedModel = "claude-sonnet-5-5";
-
-/** Adapter-side aliases observed for Claude Code ACP model config. */
-const PREFERRED_ALIASES: Record<AllowedModel, string[]> = {
-  "claude-sonnet-5-5": ["claude-sonnet-5-5", "sonnet", "sonnet-5-5", "sonnet5.5"],
-  "claude-haiku-5-5": ["claude-haiku-5-5", "haiku", "haiku-5-5", "haiku5.5"],
-};
+/** Model helpers: pass through any id the adapter lists; no hardcoded allowlist. */
 
 export type ModelOption = {
   value: string;
@@ -20,66 +6,122 @@ export type ModelOption = {
   description?: string;
 };
 
-export function parseModel(raw: string | undefined): AllowedModel {
-  const value = (raw ?? DEFAULT_MODEL).trim();
-  if ((ALLOWED_MODELS as readonly string[]).includes(value)) {
-    return value as AllowedModel;
-  }
-  throw new Error(
-    `Unsupported model "${value}". Allowed: ${ALLOWED_MODELS.join(", ")}`,
-  );
+function normalize(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/^claude[-_]?/, "")
+    .replace(/[\s_.]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
 }
 
-function familyOf(preferred: AllowedModel): "sonnet" | "haiku" {
-  return preferred.includes("haiku") ? "haiku" : "sonnet";
+function familyOf(s: string): string | null {
+  const n = normalize(s);
+  const m = n.match(/(sonnet|haiku|opus|fable)/);
+  return m ? m[1] : null;
 }
 
-/** Pick the best listed config value for a preferred user model id. */
+function versionOf(s: string): string | null {
+  const m = normalize(s).match(/(\d)[.-]?(\d)/);
+  return m ? `${m[1]}.${m[2]}` : null;
+}
+
+function optionHay(opt: ModelOption): string {
+  return `${opt.value} ${opt.name ?? ""} ${opt.description ?? ""}`;
+}
+
+/**
+ * Resolve a user-requested model id/alias against the adapter's listed options.
+ * Matches exact value, case-insensitive value, normalized id, family+version,
+ * then name/description substrings.
+ * Returns null if nothing matches (caller should error with the available list).
+ */
 export function resolveListedModelValue(
-  preferred: AllowedModel,
+  requested: string,
   options: ModelOption[],
 ): string | null {
-  if (options.length === 0) return null;
+  const q = requested.trim();
+  if (!q || options.length === 0) return null;
 
-  const aliases = PREFERRED_ALIASES[preferred].map((a) => a.toLowerCase());
-  const family = familyOf(preferred);
+  const lower = q.toLowerCase();
+  const normQ = normalize(q);
+  const famQ = familyOf(q);
+  const verQ = versionOf(q);
 
-  // 1. Exact value match against preferred id or known aliases
   for (const opt of options) {
-    if (aliases.includes(opt.value.toLowerCase())) return opt.value;
+    if (opt.value === q) return opt.value;
+  }
+  for (const opt of options) {
+    if (opt.value.toLowerCase() === lower) return opt.value;
+  }
+  for (const opt of options) {
+    if (normalize(opt.value) === normQ) return opt.value;
   }
 
-  // 2. Name/description says "Sonnet 5.5" / "Haiku 5.5"
-  for (const opt of options) {
-    const hay = `${opt.value} ${opt.name ?? ""} ${opt.description ?? ""}`.toLowerCase();
-    if (!hay.includes(family)) continue;
-    if (/5[.\s-]?5/.test(hay)) return opt.value;
+  if (famQ) {
+    type Hit = { value: string; score: number };
+    const hits: Hit[] = [];
+    for (const opt of options) {
+      const hay = optionHay(opt);
+      if (familyOf(hay) !== famQ) continue;
+      const verO = versionOf(hay);
+      let score = 10;
+      if (verQ && verO === verQ) score += 100;
+      else if (verQ && verO && verO !== verQ) continue; // wrong version
+      if (normalize(opt.value) === famQ) score += 30;
+      score -= Math.min(opt.value.length, 40);
+      hits.push({ value: opt.value, score });
+    }
+    if (hits.length > 0) {
+      hits.sort((a, b) => b.score - a.score);
+      return hits[0].value;
+    }
   }
 
-  // 3. Family-only fallback (e.g. value "sonnet" with name "Sonnet")
+  const scored: { value: string; score: number }[] = [];
   for (const opt of options) {
-    const hay = `${opt.value} ${opt.name ?? ""}`.toLowerCase();
-    if (hay === family || hay.startsWith(family + " ")) return opt.value;
+    const hay = optionHay(opt).toLowerCase();
+    if (!hay.includes(lower) && !hay.includes(normQ)) continue;
+    let score = 0;
+    if ((opt.name ?? "").toLowerCase() === lower) score += 100;
+    if (opt.value.toLowerCase().startsWith(lower)) score += 50;
+    if ((opt.name ?? "").toLowerCase().includes(lower)) score += 20;
+    score -= opt.value.length;
+    scored.push({ value: opt.value, score });
+  }
+  if (scored.length > 0) {
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0].value;
   }
 
   return null;
 }
 
-/** Whether the agent's currentValue satisfies the requested model. */
+/** Whether currentValue satisfies the requested model. */
 export function modelMatches(
-  preferred: AllowedModel,
+  requested: string,
   currentValue: string | null | undefined,
   options: ModelOption[],
 ): boolean {
   if (!currentValue) return false;
-  const resolved = resolveListedModelValue(preferred, options);
+  const resolved = resolveListedModelValue(requested, options);
   if (resolved && currentValue === resolved) return true;
+  if (currentValue.toLowerCase() === requested.trim().toLowerCase()) return true;
 
-  const aliases = PREFERRED_ALIASES[preferred].map((a) => a.toLowerCase());
-  if (aliases.includes(currentValue.toLowerCase())) return true;
-
-  const family = familyOf(preferred);
+  const famR = familyOf(requested);
+  if (!famR) return false;
   const opt = options.find((o) => o.value === currentValue);
-  const hay = `${currentValue} ${opt?.name ?? ""} ${opt?.description ?? ""}`.toLowerCase();
-  return hay.includes(family) && /5[.\s-]?5/.test(hay);
+  const hay = opt ? optionHay(opt) : currentValue;
+  if (familyOf(hay) !== famR) return false;
+  const verR = versionOf(requested);
+  if (!verR) return true;
+  const verH = versionOf(hay);
+  return !verH || verH === verR;
+}
+
+export function formatAvailableModels(options: ModelOption[]): string {
+  if (options.length === 0) return "(none listed)";
+  return options
+    .map((o) => (o.name ? `${o.value} (${o.name})` : o.value))
+    .join(", ");
 }

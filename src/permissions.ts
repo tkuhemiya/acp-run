@@ -1,10 +1,19 @@
 import path from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 
+export type PermissionMode = "allow-all" | "safe";
+
 export type PermissionPolicy = {
-  /** Absolute cwd; reads/edits whose paths resolve under this are allowed. */
+  /** Absolute cwd; used by "safe" mode to scope read/edit/execute. */
   cwd: string;
-  /** When true, also allow execute tools whose cwd/working dir is inside cwd. Default false. */
+  /**
+   * "allow-all" (default): auto-approve every permission request, preferring
+   * allow_always then allow_once. Intended for disposable servers/sandboxes.
+   * "safe": allow read/edit inside cwd only; deny execute/fetch/outside unless
+   * allowExecuteInCwd is set.
+   */
+  mode?: PermissionMode;
+  /** When mode is "safe", also allow execute tools scoped to cwd. Default false. */
   allowExecuteInCwd?: boolean;
 };
 
@@ -50,12 +59,7 @@ function pickOption(
   return undefined;
 }
 
-/**
- * Default policy: allow read/edit (and similar) when every named path is inside
- * cwd; otherwise reject. Execute/delete/fetch/other denied unless explicitly
- * allowed by policy flags.
- */
-export function decidePermission(
+function decideSafe(
   params: acp.RequestPermissionRequest,
   policy: PermissionPolicy,
 ): acp.RequestPermissionResponse {
@@ -70,21 +74,19 @@ export function decidePermission(
 
   let allow = false;
   if (kind === "read" || kind === "search") {
-    allow = allInside || noPaths; // search with no path often means workspace-scoped
+    allow = allInside || noPaths;
   } else if (kind === "edit" || kind === "move") {
     allow = allInside;
   } else if (kind === "delete") {
-    allow = allInside; // still inside cwd only
+    allow = allInside;
   } else if (kind === "execute") {
     allow = Boolean(policy.allowExecuteInCwd) && (allInside || noPaths);
   } else if (kind === "think" || kind === "switch_mode") {
     allow = true;
   } else {
-    // fetch / other: deny by default
     allow = false;
   }
 
-  // Title/path fallback: if kind missing but paths all inside and looks like file op
   if (!allow && allInside && (kind === "other" || !tool.kind)) {
     allow = true;
   }
@@ -94,7 +96,6 @@ export function decidePermission(
     : pickOption(params.options, ["reject_once", "reject_always"]);
 
   if (!selected) {
-    // No matching option — cancel rather than guess
     return { outcome: { outcome: "cancelled" } };
   }
 
@@ -104,4 +105,35 @@ export function decidePermission(
       optionId: selected.optionId,
     },
   };
+}
+
+function decideAllowAll(
+  params: acp.RequestPermissionRequest,
+): acp.RequestPermissionResponse {
+  // Prefer "allow always" so subsequent identical tool calls aren't re-prompted.
+  const selected = pickOption(params.options, ["allow_always", "allow_once"]);
+  if (!selected) {
+    return { outcome: { outcome: "cancelled" } };
+  }
+  return {
+    outcome: {
+      outcome: "selected",
+      optionId: selected.optionId,
+    },
+  };
+}
+
+/**
+ * Decide a session/request_permission response.
+ * Default mode is allow-all (permissive; for disposable sandboxes).
+ */
+export function decidePermission(
+  params: acp.RequestPermissionRequest,
+  policy: PermissionPolicy,
+): acp.RequestPermissionResponse {
+  const mode: PermissionMode = policy.mode ?? "allow-all";
+  if (mode === "allow-all") {
+    return decideAllowAll(params);
+  }
+  return decideSafe(params, policy);
 }

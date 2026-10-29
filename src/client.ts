@@ -5,20 +5,24 @@ import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import * as acp from "@agentclientprotocol/sdk";
 import {
-  type AllowedModel,
   type ModelOption,
-  DEFAULT_MODEL,
+  formatAvailableModels,
   modelMatches,
   resolveListedModelValue,
 } from "./models.js";
-import { decidePermission, type PermissionPolicy } from "./permissions.js";
+import {
+  decidePermission,
+  type PermissionMode,
+  type PermissionPolicy,
+} from "./permissions.js";
 import { createUpdateLogger, type UpdateLogger } from "./log.js";
 
 const MODEL_CONFIG_ID = "model";
 
 export type AcpClientOptions = {
   cwd: string;
-  model?: AllowedModel;
+  /** Any model id/alias the adapter lists. Omit to leave the adapter default. */
+  model?: string;
   /** Existing session to load/resume. */
   sessionId?: string;
   /** Prefer resume (no history replay) when agent supports it. Default true. */
@@ -36,7 +40,8 @@ export type AcpClientOptions = {
 export type PromptResult = {
   sessionId: string;
   stopReason: string;
-  modelRequested: AllowedModel;
+  /** Requested model, or null when no override was asked for. */
+  modelRequested: string | null;
   modelSet: string | null;
   modelVerified: boolean;
   availableModels: string[];
@@ -46,7 +51,6 @@ function findAdapterBin(): string {
   const fromEnv = process.env.CLAUDE_AGENT_ACP_BIN;
   if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
 
-  // Prefer local node_modules bin next to this package
   const here = path.dirname(fileURLToPath(import.meta.url));
   const local = path.resolve(here, "../node_modules/.bin/claude-agent-acp");
   if (fs.existsSync(local)) return local;
@@ -95,25 +99,49 @@ function collectModelOptions(
 async function applyModel(
   ctx: acp.ClientContext,
   sessionId: string,
-  model: AllowedModel,
+  model: string | undefined,
   configOptions: acp.SessionConfigOption[] | null | undefined,
   log: (line: string) => void,
-): Promise<{ modelSet: string | null; modelVerified: boolean; availableModels: string[] }> {
+): Promise<{
+  modelRequested: string | null;
+  modelSet: string | null;
+  modelVerified: boolean;
+  availableModels: string[];
+}> {
   const modelInfo = collectModelOptions(configOptions);
   const availableModels = modelInfo.options.map((o) => o.value);
   log(
-    `available models (${availableModels.length}): ${modelInfo.options
-      .map((o) => `${o.value}${o.name ? ` (${o.name})` : ""}`)
-      .join(", ")}`,
+    `available models (${availableModels.length}): ${formatAvailableModels(modelInfo.options)}`,
   );
 
-  if (modelInfo.options.length === 0) {
-    log("⚠ agent did not expose a model config option; cannot verify model");
-    return { modelSet: null, modelVerified: false, availableModels };
+  const current =
+    typeof modelInfo.currentValue === "string" ? modelInfo.currentValue : null;
+
+  // No override requested — leave adapter default alone.
+  if (!model) {
+    log(`no --model override; using adapter default currentValue=${current ?? "(none)"}`);
+    return {
+      modelRequested: null,
+      modelSet: current,
+      modelVerified: true,
+      availableModels,
+    };
   }
 
-  const resolved = resolveListedModelValue(model, modelInfo.options) ?? model;
-  log(`setting model config → ${resolved}`);
+  if (modelInfo.options.length === 0) {
+    throw new Error(
+      `Cannot set model "${model}": agent did not expose a model config option. available=(none listed)`,
+    );
+  }
+
+  const resolved = resolveListedModelValue(model, modelInfo.options);
+  if (!resolved) {
+    throw new Error(
+      `Unknown model "${model}". Available: ${formatAvailableModels(modelInfo.options)}`,
+    );
+  }
+
+  log(`setting model config → ${resolved} (requested=${model})`);
   const setResult = await ctx.request(acp.methods.agent.session.setConfigOption, {
     sessionId,
     configId: MODEL_CONFIG_ID,
@@ -122,20 +150,36 @@ async function applyModel(
   const after = collectModelOptions(setResult.configOptions);
   const modelSet =
     typeof after.currentValue === "string" ? after.currentValue : resolved;
-  const modelVerified = modelMatches(
-    model,
-    modelSet,
-    after.options.length ? after.options : modelInfo.options,
-  );
+  const optsForMatch = after.options.length ? after.options : modelInfo.options;
+  const modelVerified = modelMatches(model, modelSet, optsForMatch);
   log(`model currentValue=${modelSet} verified=${modelVerified}`);
   if (!modelVerified) {
     throw new Error(
-      `Refusing to continue: model not verified. requested=${model} set=${modelSet} available=${availableModels.join(",")}`,
+      `Refusing to continue: model not verified. requested=${model} set=${modelSet} available=${formatAvailableModels(optsForMatch)}`,
     );
   }
-  return { modelSet, modelVerified, availableModels };
+  return {
+    modelRequested: model,
+    modelSet,
+    modelVerified,
+    availableModels: after.options.length
+      ? after.options.map((o) => o.value)
+      : availableModels,
+  };
 }
 
+function resolvePolicy(
+  cwd: string,
+  partial?: Partial<PermissionPolicy>,
+): PermissionPolicy {
+  const mode: PermissionMode = partial?.mode ?? "allow-all";
+  return {
+    cwd,
+    mode,
+    allowExecuteInCwd:
+      partial?.allowExecuteInCwd ?? (mode === "allow-all" ? true : false),
+  };
+}
 
 export class ClaudeAcpClient {
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -152,21 +196,60 @@ export class ClaudeAcpClient {
     });
   }
 
+  private fsAllowed(absPath: string, policy: PermissionPolicy): boolean {
+    if ((policy.mode ?? "allow-all") === "allow-all") return true;
+    return absPath === this.cwd || absPath.startsWith(this.cwd + path.sep);
+  }
+
+  private attachHandlers(
+    builder: ReturnType<typeof acp.client>,
+    policy: PermissionPolicy,
+  ) {
+    return builder
+      .onRequest(acp.methods.client.session.requestPermission, async (ctx) => {
+        const decision = decidePermission(ctx.params, policy);
+        const title = ctx.params.toolCall.title ?? ctx.params.toolCall.toolCallId;
+        this.logger.logLine(
+          `🔐 permission ${decision.outcome.outcome === "selected" ? decision.outcome.optionId : decision.outcome.outcome} for: ${title}`,
+        );
+        return decision;
+      })
+      .onRequest(acp.methods.client.fs.readTextFile, async (ctx) => {
+        const p = path.resolve(ctx.params.path);
+        if (!this.fsAllowed(p, policy)) {
+          throw new Error(`fs/read_text_file denied outside cwd: ${p}`);
+        }
+        const content = await fs.promises.readFile(p, "utf8");
+        return { content };
+      })
+      .onRequest(acp.methods.client.fs.writeTextFile, async (ctx) => {
+        const p = path.resolve(ctx.params.path);
+        if (!this.fsAllowed(p, policy)) {
+          throw new Error(`fs/write_text_file denied outside cwd: ${p}`);
+        }
+        await fs.promises.mkdir(path.dirname(p), { recursive: true });
+        await fs.promises.writeFile(p, ctx.params.content, "utf8");
+        return {};
+      })
+      .onNotification(acp.methods.client.session.update, async (ctx) => {
+        void ctx;
+      });
+  }
+
   async runPrompt(prompt: string): Promise<PromptResult> {
-    const model = this.opts.model ?? DEFAULT_MODEL;
+    const model = this.opts.model?.trim() || undefined;
     const adapter = this.opts.adapterCommand ?? findAdapterBin();
     const args = this.opts.adapterArgs ?? [];
 
     this.logger.logLine(`ACP adapter: ${adapter} ${args.join(" ")}`.trim());
     this.logger.logLine(`cwd: ${this.cwd}`);
-    this.logger.logLine(`model requested: ${model}`);
+    this.logger.logLine(`model requested: ${model ?? "(adapter default)"}`);
 
     this.child = spawn(adapter, args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
         ...this.opts.env,
-        // Ensure OAuth token is visible to adapter if present in parent env
         ...(process.env.CLAUDE_CODE_OAUTH_TOKEN
           ? { CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN }
           : {}),
@@ -176,7 +259,6 @@ export class ClaudeAcpClient {
 
     this.child.stderr.on("data", (buf: Buffer) => {
       const text = buf.toString("utf8");
-      // Never echo secrets; stderr from adapter is fine to show
       for (const line of text.split(/\r?\n/)) {
         if (!line) continue;
         if (/oauth|token|authorization|api[_-]?key/i.test(line)) {
@@ -193,53 +275,21 @@ export class ClaudeAcpClient {
     ) as ReadableStream<Uint8Array>;
     const stream = acp.ndJsonStream(input, output);
 
-    const policy: PermissionPolicy = {
-      cwd: this.cwd,
-      allowExecuteInCwd: this.opts.permissionPolicy?.allowExecuteInCwd ?? false,
-      ...this.opts.permissionPolicy,
-    };
+    const policy = resolvePolicy(this.cwd, this.opts.permissionPolicy);
+    this.logger.logLine(`permission mode: ${policy.mode}`);
 
     try {
-      const result = await acp
-        .client({ name: "grok-acp-run" })
-        .onRequest(acp.methods.client.session.requestPermission, async (ctx) => {
-          const decision = decidePermission(ctx.params, policy);
-          const title = ctx.params.toolCall.title ?? ctx.params.toolCall.toolCallId;
-          this.logger.logLine(
-            `🔐 permission ${decision.outcome.outcome === "selected" ? decision.outcome.optionId : decision.outcome.outcome} for: ${title}`,
-          );
-          return decision;
-        })
-        .onRequest(acp.methods.client.fs.readTextFile, async (ctx) => {
-          const p = path.resolve(ctx.params.path);
-          if (!p.startsWith(this.cwd + path.sep) && p !== this.cwd) {
-            throw new Error(`fs/read_text_file denied outside cwd: ${p}`);
-          }
-          const content = await fs.promises.readFile(p, "utf8");
-          return { content };
-        })
-        .onRequest(acp.methods.client.fs.writeTextFile, async (ctx) => {
-          const p = path.resolve(ctx.params.path);
-          if (!p.startsWith(this.cwd + path.sep) && p !== this.cwd) {
-            throw new Error(`fs/write_text_file denied outside cwd: ${p}`);
-          }
-          await fs.promises.mkdir(path.dirname(p), { recursive: true });
-          await fs.promises.writeFile(p, ctx.params.content, "utf8");
-          return {};
-        })
-        .onNotification(acp.methods.client.session.update, async (ctx) => {
-          // Also received via ActiveSession.nextUpdate; keep a raw log copy
-          // only when not consumed — ActiveSession path handles streaming.
-          void ctx;
-        })
-        .connectWith(stream, async (ctx) => {
+      const result = await this.attachHandlers(
+        acp.client({ name: "acp-run" }),
+        policy,
+      ).connectWith(stream, async (ctx) => {
           const init = await ctx.request(acp.methods.agent.initialize, {
             protocolVersion: acp.PROTOCOL_VERSION,
             clientCapabilities: {
               fs: { readTextFile: true, writeTextFile: true },
             },
             clientInfo: {
-              name: "grok-acp-run",
+              name: "acp-run",
               version: "1.0.0",
             },
           });
@@ -276,7 +326,11 @@ export class ClaudeAcpClient {
                 mcpServers: [],
               });
               configOptions = resumed?.configOptions;
-              session = (ctx as unknown as { attachSession: (r: { sessionId: string }) => acp.ActiveSession }).attachSession({
+              session = (
+                ctx as unknown as {
+                  attachSession: (r: { sessionId: string }) => acp.ActiveSession;
+                }
+              ).attachSession({
                 sessionId,
                 ...(resumed ?? {}),
               });
@@ -288,7 +342,11 @@ export class ClaudeAcpClient {
                 mcpServers: [],
               });
               configOptions = loaded?.configOptions;
-              session = (ctx as unknown as { attachSession: (r: { sessionId: string }) => acp.ActiveSession }).attachSession({
+              session = (
+                ctx as unknown as {
+                  attachSession: (r: { sessionId: string }) => acp.ActiveSession;
+                }
+              ).attachSession({
                 sessionId,
                 ...(loaded ?? {}),
               });
@@ -298,20 +356,18 @@ export class ClaudeAcpClient {
               );
             }
           } else {
-            session = await ctx.buildSession({
-              cwd: this.cwd,
-              mcpServers: [],
-            }).start();
+            session = await ctx
+              .buildSession({
+                cwd: this.cwd,
+                mcpServers: [],
+              })
+              .start();
             sessionId = session.sessionId;
             configOptions = session.newSessionResponse.configOptions;
             this.logger.logLine(`📝 session ${sessionId}`);
           }
 
-          const {
-            modelSet,
-            modelVerified,
-            availableModels,
-          } = await applyModel(
+          const modelResult = await applyModel(
             ctx,
             sessionId,
             model,
@@ -319,7 +375,9 @@ export class ClaudeAcpClient {
             (line) => this.logger.logLine(line),
           );
 
-          this.logger.logLine(`💬 prompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? "…" : ""}`);
+          this.logger.logLine(
+            `💬 prompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? "…" : ""}`,
+          );
           void session.prompt(prompt);
 
           let stopReason = "unknown";
@@ -335,7 +393,6 @@ export class ClaudeAcpClient {
 
           session.dispose();
 
-          // Best-effort close
           const closeCap = (
             caps as { sessionCapabilities?: { close?: unknown } }
           ).sessionCapabilities?.close;
@@ -350,10 +407,10 @@ export class ClaudeAcpClient {
           return {
             sessionId,
             stopReason,
-            modelRequested: model,
-            modelSet,
-            modelVerified,
-            availableModels,
+            modelRequested: modelResult.modelRequested,
+            modelSet: modelResult.modelSet,
+            modelVerified: modelResult.modelVerified,
+            availableModels: modelResult.availableModels,
           } satisfies PromptResult;
         });
 
@@ -371,7 +428,7 @@ export class ClaudeAcpClient {
     prompts: string[],
   ): Promise<{ sessionId: string; results: PromptResult[] }> {
     if (prompts.length === 0) throw new Error("no prompts");
-    const model = this.opts.model ?? DEFAULT_MODEL;
+    const model = this.opts.model?.trim() || undefined;
     const adapter = this.opts.adapterCommand ?? findAdapterBin();
     const args = this.opts.adapterArgs ?? [];
 
@@ -405,46 +462,20 @@ export class ClaudeAcpClient {
     ) as ReadableStream<Uint8Array>;
     const stream = acp.ndJsonStream(input, output);
 
-    const policy: PermissionPolicy = {
-      cwd: this.cwd,
-      allowExecuteInCwd: this.opts.permissionPolicy?.allowExecuteInCwd ?? true,
-      ...this.opts.permissionPolicy,
-    };
+    const policy = resolvePolicy(this.cwd, this.opts.permissionPolicy);
+    this.logger.logLine(`permission mode: ${policy.mode}`);
 
     try {
-      return await acp
-        .client({ name: "grok-acp-run" })
-        .onRequest(acp.methods.client.session.requestPermission, async (ctx) => {
-          const decision = decidePermission(ctx.params, policy);
-          const title = ctx.params.toolCall.title ?? ctx.params.toolCall.toolCallId;
-          this.logger.logLine(
-            `🔐 permission ${decision.outcome.outcome === "selected" ? decision.outcome.optionId : decision.outcome.outcome} for: ${title}`,
-          );
-          return decision;
-        })
-        .onRequest(acp.methods.client.fs.readTextFile, async (ctx) => {
-          const p = path.resolve(ctx.params.path);
-          if (!p.startsWith(this.cwd + path.sep) && p !== this.cwd) {
-            throw new Error(`fs/read_text_file denied outside cwd: ${p}`);
-          }
-          return { content: await fs.promises.readFile(p, "utf8") };
-        })
-        .onRequest(acp.methods.client.fs.writeTextFile, async (ctx) => {
-          const p = path.resolve(ctx.params.path);
-          if (!p.startsWith(this.cwd + path.sep) && p !== this.cwd) {
-            throw new Error(`fs/write_text_file denied outside cwd: ${p}`);
-          }
-          await fs.promises.mkdir(path.dirname(p), { recursive: true });
-          await fs.promises.writeFile(p, ctx.params.content, "utf8");
-          return {};
-        })
-        .connectWith(stream, async (ctx) => {
+      return await this.attachHandlers(
+        acp.client({ name: "acp-run" }),
+        policy,
+      ).connectWith(stream, async (ctx) => {
           await ctx.request(acp.methods.agent.initialize, {
             protocolVersion: acp.PROTOCOL_VERSION,
             clientCapabilities: {
               fs: { readTextFile: true, writeTextFile: true },
             },
-            clientInfo: { name: "grok-acp-run", version: "1.0.0" },
+            clientInfo: { name: "acp-run", version: "1.0.0" },
           });
 
           const session = await ctx
@@ -453,11 +484,7 @@ export class ClaudeAcpClient {
           const sessionId = session.sessionId;
           this.logger.logLine(`📝 session ${sessionId}`);
 
-          const {
-            modelSet,
-            modelVerified,
-            availableModels,
-          } = await applyModel(
+          const modelResult = await applyModel(
             ctx,
             sessionId,
             model,
@@ -483,10 +510,10 @@ export class ClaudeAcpClient {
             results.push({
               sessionId,
               stopReason,
-              modelRequested: model,
-              modelSet,
-              modelVerified,
-              availableModels,
+              modelRequested: modelResult.modelRequested,
+              modelSet: modelResult.modelSet,
+              modelVerified: modelResult.modelVerified,
+              availableModels: modelResult.availableModels,
             });
           }
 

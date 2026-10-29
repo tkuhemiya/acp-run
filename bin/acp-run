@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resolve through symlinks so ~/.local/bin/acp-run still finds /workspace/acp
+# Resolve through symlinks so a linked ~/.local/bin/acp-run still finds the package root
 SOURCE="${BASH_SOURCE[0]}"
 while [[ -L "$SOURCE" ]]; do
   DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"

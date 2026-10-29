@@ -12,14 +12,12 @@ async function main() {
     cwd: tmp,
     model: "claude-sonnet-5-5",
     logFile,
-    // File writes may go through Claude Code tools which can involve Bash;
-    // allow execute inside cwd for the e2e.
-    permissionPolicy: { allowExecuteInCwd: true },
+    // Default permission mode is allow-all; no need to elevate.
   });
 
   const { sessionId, results } = await client.runPromptsInSameSession([
-    'Create a file named hello.txt in the current working directory containing exactly: hello world',
-    'Edit hello.txt so its contents are exactly: hello ACP',
+    "Create a file named hello.txt in the current working directory containing exactly: hello world",
+    "Edit hello.txt so its contents are exactly: hello ACP",
   ]);
 
   console.log(`\nSESSION_ID=${sessionId}`);
@@ -41,7 +39,6 @@ async function main() {
   }
   console.log("E2E PASS");
 }
-
 main().catch((err) => {
   console.error(err);
   process.exit(1);
