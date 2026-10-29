@@ -1,0 +1,25 @@
+{
+  "name": "acp-claude-client",
+  "version": "1.0.0",
+  "description": "Reusable ACP client for Claude Code via claude-agent-acp",
+  "type": "module",
+  "bin": {
+    "acp-run": "./bin/acp-run"
+  },
+  "scripts": {
+    "acp-run": "tsx src/cli.ts",
+    "test:e2e": "tsx src/e2e-test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.99.0",
+    "@agentclientprotocol/sdk": "2.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
